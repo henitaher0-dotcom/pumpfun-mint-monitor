@@ -8,7 +8,7 @@ function normalizeName(value: string): string {
 
 export class WatchlistService {
   private readonly filePath =
-    process.env.WATCHLIST_PATH ||
+    process.env["WATCHLIST_PATH"] ||
     path.join("/tmp", "solana-ca-hunter", "watchlist.json");
 
   private names: string[] = [];
