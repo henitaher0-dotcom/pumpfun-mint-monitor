@@ -1,7 +1,9 @@
+
 import { Bot } from "grammy";
 import type { AppConfig } from "../config.js";
 import type { PumpPortalClient } from "../websocket/pumpPortal.js";
 import type { TokenService } from "../services/tokenService.js";
+import type { WatchlistService } from "../services/watchlistService.js";
 import { logger } from "../utils/logger.js";
 import { escapeHtmlForTelegram } from "./messages.js";
 import type { TelegramNotificationQueue } from "./outboundQueue.js";
@@ -12,20 +14,13 @@ function formatDuration(ms: number): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
 
-  if (hours > 0) {
-    return `${hours}h ${minutes}m ${seconds}s`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
+  if (hours > 0) return `${hours}h ${minutes}m ${seconds}s`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
   return `${seconds}s`;
 }
 
 function formatIsoTimestamp(timestamp: number | null): string {
-  if (timestamp === null) {
-    return "N/A";
-  }
-  return new Date(timestamp).toISOString();
+  return timestamp === null ? "N/A" : new Date(timestamp).toISOString();
 }
 
 export interface TelegramBotContext {
@@ -33,17 +28,77 @@ export interface TelegramBotContext {
   pumpPortalClient: PumpPortalClient;
   tokenService: TokenService;
   notificationQueue: TelegramNotificationQueue;
+  watchlistService: WatchlistService;
 }
 
-export function registerTelegramCommands(bot: Bot, context: TelegramBotContext): void {
-  const { config, pumpPortalClient, tokenService, notificationQueue } = context;
+export function registerTelegramCommands(
+  bot: Bot,
+  context: TelegramBotContext,
+): void {
+  const {
+    config,
+    pumpPortalClient,
+    tokenService,
+    notificationQueue,
+    watchlistService,
+  } = context;
 
-  const isAuthorized = (chatId: number | undefined): boolean => {
-    if (chatId === undefined) {
-      return false;
+  const isAuthorized = (chatId: number | undefined): boolean =>
+    chatId !== undefined && String(chatId) === config.telegramChatId;
+
+  bot.command("add", async (ctx) => {
+    if (!isAuthorized(ctx.chat?.id)) return;
+
+    const name = ctx.match.trim();
+
+    if (!name) {
+      await ctx.reply("اكتب الاسم بعد الأمر، مثال:\n/add GTA6TRUMP");
+      return;
     }
-    return String(chatId) === config.telegramChatId;
-  };
+
+    const added = await watchlistService.add(name);
+
+    await ctx.reply(
+      added
+        ? `✅ تمت إضافة الاسم للمراقبة:\n${name}`
+        : `⚠️ الاسم موجود بالفعل أو غير صالح:\n${name}`,
+    );
+  });
+
+  bot.command("list", async (ctx) => {
+    if (!isAuthorized(ctx.chat?.id)) return;
+
+    const names = watchlistService.getNames();
+
+    if (names.length === 0) {
+      await ctx.reply("قائمة المراقبة فارغة.\nأضف اسمًا باستعمال /add");
+      return;
+    }
+
+    await ctx.reply(
+      "📋 أسماء العملات التي تراقبها:\n\n" +
+        names.map((name, index) => `${index + 1}. ${name}`).join("\n"),
+    );
+  });
+
+  bot.command("remove", async (ctx) => {
+    if (!isAuthorized(ctx.chat?.id)) return;
+
+    const name = ctx.match.trim();
+
+    if (!name) {
+      await ctx.reply("اكتب الاسم الذي تريد حذفه، مثال:\n/remove GTA6TRUMP");
+      return;
+    }
+
+    const removed = await watchlistService.remove(name);
+
+    await ctx.reply(
+      removed
+        ? `🗑 تم حذف الاسم:\n${name}`
+        : `لم أجد هذا الاسم في القائمة:\n${name}`,
+    );
+  });
 
   bot.command("start", async (ctx) => {
     if (!isAuthorized(ctx.chat?.id)) {
@@ -57,7 +112,6 @@ export function registerTelegramCommands(bot: Bot, context: TelegramBotContext):
 
     await ctx.reply(
       "✅ Pump.fun mint monitor started.\n\nListening for new token creation events via PumpPortal.\nTrading: DISABLED",
-      { parse_mode: "HTML" },
     );
   });
 
@@ -73,15 +127,11 @@ export function registerTelegramCommands(bot: Bot, context: TelegramBotContext):
 
     await ctx.reply(
       "⏹ Pump.fun mint monitor stopped.\n\nNo further notifications will be sent until /start.",
-      { parse_mode: "HTML" },
     );
   });
 
   bot.command("status", async (ctx) => {
-    if (!isAuthorized(ctx.chat?.id)) {
-      logger.telegramWarn(`Ignored /status from unauthorized chat ${ctx.chat?.id ?? "unknown"}`);
-      return;
-    }
+    if (!isAuthorized(ctx.chat?.id)) return;
 
     const stats = tokenService.getStats();
     const wsState = pumpPortalClient.getConnectionState();
@@ -94,42 +144,38 @@ export function registerTelegramCommands(bot: Bot, context: TelegramBotContext):
       `<b>Monitoring:</b> ${monitoring ? "ACTIVE" : "STOPPED"}`,
       `<b>Tokens received:</b> ${stats.totalTokensReceived}`,
       `<b>Unique mints tracked:</b> ${stats.seenMintCount}`,
+      `<b>Names in watchlist:</b> ${watchlistService.getNames().length}`,
       `<b>Runtime:</b> ${formatDuration(stats.sessionRuntimeMs)}`,
       `<b>Tokens/min:</b> ${stats.tokensPerMinute.toFixed(2)}`,
       `<b>Last event received:</b> ${formatIsoTimestamp(stats.lastEventReceivedAt)}`,
       `<b>Last blockchain timestamp:</b> ${formatIsoTimestamp(stats.lastBlockchainCreatedAt)}`,
       `<b>Trading:</b> DISABLED`,
-      "",
-      `<i>Updated: ${formatIsoTimestamp(Date.now())}</i>`,
     ].join("\n");
 
     await ctx.reply(message, { parse_mode: "HTML" });
   });
 
   bot.command("help", async (ctx) => {
-    if (!isAuthorized(ctx.chat?.id)) {
-      logger.telegramWarn(`Ignored /help from unauthorized chat ${ctx.chat?.id ?? "unknown"}`);
-      return;
-    }
+    if (!isAuthorized(ctx.chat?.id)) return;
 
     await ctx.reply(
       [
         "<b>Pump.fun Mint Monitor</b>",
         "",
-        "Read-only monitoring of new Pump.fun token creation events.",
-        "",
         "<b>Commands</b>",
-        "/start — Start the PumpPortal WebSocket listener",
-        "/stop — Stop monitoring and close the WebSocket",
-        "/status — Show connection, stats, and runtime",
+        "/start — Start monitoring",
+        "/stop — Stop monitoring",
+        "/status — Show monitor status",
+        "/add NAME — Add a name to watch",
+        "/list — Show watched names",
+        "/remove NAME — Remove a watched name",
         "/help — Show this message",
         "",
+        "Alerts are sent only when a new token name contains a watched name.",
+        "Matching ignores uppercase/lowercase and spaces.",
         "<b>Trading:</b> DISABLED",
-        "",
-        "This bot does not buy, sell, sign transactions, or connect to wallets.",
       ].join("\n"),
       { parse_mode: "HTML" },
     );
   });
-
 }
