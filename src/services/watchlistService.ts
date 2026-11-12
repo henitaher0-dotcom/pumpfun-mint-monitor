@@ -7,11 +7,9 @@ function normalizeName(value: string): string {
 }
 
 export class WatchlistService {
-  private readonly filePath = path.join(
-    process.cwd(),
-    "data",
-    "watchlist.json",
-  );
+  private readonly filePath =
+    process.env.WATCHLIST_PATH ||
+    path.join("/tmp", "solana-ca-hunter", "watchlist.json");
 
   private names: string[] = [];
 
@@ -54,11 +52,13 @@ export class WatchlistService {
     await mkdir(path.dirname(this.filePath), { recursive: true });
 
     const temporaryPath = `${this.filePath}.tmp`;
+
     await writeFile(
       temporaryPath,
       JSON.stringify(this.names, null, 2),
       "utf8",
     );
+
     await rename(temporaryPath, this.filePath);
   }
 
