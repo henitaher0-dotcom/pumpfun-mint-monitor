@@ -1,8 +1,10 @@
+
 import { Bot } from "grammy";
 import { loadConfig, type AppConfig } from "./config.js";
 import { HealthServer } from "./health/healthServer.js";
 import { MonitorWatchdog } from "./health/watchdog.js";
 import { TokenService } from "./services/tokenService.js";
+import { WatchlistService } from "./services/watchlistService.js";
 import { registerTelegramCommands } from "./telegram/bot.js";
 import { TelegramNotificationQueue } from "./telegram/outboundQueue.js";
 import { logger } from "./utils/logger.js";
@@ -17,11 +19,27 @@ async function main(): Promise<void> {
     const message = error instanceof Error ? error.message : String(error);
     logger.appError(message);
     process.exit(1);
+    return;
+  }
+
+  const watchlistService = new WatchlistService();
+
+  try {
+    await watchlistService.load();
+    logger.app(`Loaded ${watchlistService.getNames().length} watched name(s)`);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    logger.appError(`Could not load watchlist: ${message}`);
+    process.exit(1);
+    return;
   }
 
   const tokenService = new TokenService();
   const processStartedAt = Date.now();
-  const notificationQueueRef: { instance: TelegramNotificationQueue | null } = {
+
+  const notificationQueueRef: {
+    instance: TelegramNotificationQueue | null;
+  } = {
     instance: null,
   };
 
@@ -29,18 +47,26 @@ async function main(): Promise<void> {
     wsUrl: config.pumpPortalWsUrl,
     onToken: (event) => {
       if (tokenService.isDuplicate(event.mint)) {
-        logger.token(`Duplicate mint=${event.mint} — skipping Telegram notification`);
+        logger.token(`Duplicate mint=${event.mint} — skipping`);
         return;
       }
 
       const isNew = tokenService.recordToken(event);
-      if (!isNew) {
-        return;
-      }
+      if (!isNew) return;
 
       logger.token(`NEW mint=${event.mint}`);
 
+      if (!watchlistService.matches(event.name)) {
+        logger.token(
+          `Name does not match watchlist — skipping notification (name=${event.name ?? "unknown"})`,
+        );
+        return;
+      }
+
+      logger.token(`Watchlist match — name=${event.name}`);
+
       const queue = notificationQueueRef.instance;
+
       if (
         queue &&
         pumpPortalClient.isMonitoringEnabled() &&
@@ -52,10 +78,12 @@ async function main(): Promise<void> {
   });
 
   const bot = new Bot(config.telegramBotToken);
+
   const notificationQueue = new TelegramNotificationQueue(
     bot,
     config.telegramChatId,
   );
+
   notificationQueueRef.instance = notificationQueue;
 
   registerTelegramCommands(bot, {
@@ -63,6 +91,7 @@ async function main(): Promise<void> {
     pumpPortalClient,
     tokenService,
     notificationQueue,
+    watchlistService,
   });
 
   bot.catch((error) => {
@@ -71,8 +100,6 @@ async function main(): Promise<void> {
 
   logger.app("Trading: DISABLED");
 
-  // With no PORT or HEALTH_PORT there is no listening socket at all, which is
-  // the safest default for a VPS or a panel. Render injects PORT by itself.
   const healthServer =
     config.healthPort === null
       ? null
@@ -99,21 +126,14 @@ async function main(): Promise<void> {
         });
 
   if (config.autostartMonitoring) {
-    // Hosts that restart the app on their own schedule mean nobody is around
-    // to send /start, so resume monitoring immediately.
     notificationQueue.enable();
     pumpPortalClient.start();
     tokenService.startSession();
     logger.app("Autostart enabled — monitoring starts without waiting for /start");
   } else {
-    logger.app("Starting Telegram bot (PumpPortal stream will start on /start)");
+    logger.app("Starting Telegram bot — send /start to begin monitoring");
   }
 
-  // The failure this deployment kept hitting is a process that looks alive
-  // while monitoring is off: the bot answers commands and nothing is notified.
-  // With autostart on, the watchdog brings monitoring back by itself, and
-  // replaces a socket that is wedged or stuck mid-handshake. With autostart
-  // off there is no watchdog at all, so /stop stays stopped.
   const watchdog =
     config.autostartMonitoring
       ? new MonitorWatchdog({
@@ -145,26 +165,26 @@ async function main(): Promise<void> {
     await healthServer.start();
   } else {
     logger.app(
-      "No PORT or HEALTH_PORT set — running without an HTTP health endpoint (opening no listening port)",
+      "No PORT or HEALTH_PORT set — running without an HTTP health endpoint",
     );
   }
 
-  // Render sends SIGTERM before replacing an instance. Releasing the Telegram
-  // long-poll and the stream socket promptly keeps redeploys clean.
   let shuttingDown = false;
+
   const shutdown = async (signal: string): Promise<void> => {
-    if (shuttingDown) {
-      return;
-    }
+    if (shuttingDown) return;
+
     shuttingDown = true;
     logger.app(`${signal} received — shutting down`);
 
     try {
       watchdog?.stop();
       pumpPortalClient.stop();
+
       if (healthServer !== null) {
         await healthServer.stop();
       }
+
       await bot.stop();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -177,6 +197,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => {
     void shutdown("SIGTERM");
   });
+
   process.on("SIGINT", () => {
     void shutdown("SIGINT");
   });
@@ -186,9 +207,6 @@ async function main(): Promise<void> {
       logger.telegram("Bot is listening for commands");
     },
   }).catch((error: unknown) => {
-    // bot.stop() rejects the in-flight long poll, so a shutdown makes this
-    // promise reject with "Aborted delay". That is the expected path, not a
-    // crash, and reporting it as fatal gave the host a non-zero exit code.
     if (!shuttingDown) {
       throw error;
     }
