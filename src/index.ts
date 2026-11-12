@@ -26,7 +26,9 @@ async function main(): Promise<void> {
 
   try {
     await watchlistService.load();
-    logger.app(`Loaded ${watchlistService.getNames().length} watched name(s)`);
+    logger.app(
+      `Loaded ${watchlistService.getNames().length} watched name(s)`,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     logger.appError(`Could not load watchlist: ${message}`);
